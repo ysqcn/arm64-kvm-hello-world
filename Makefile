@@ -1,5 +1,5 @@
 kvm_test: hello_world.elf
-	$(CXX) -o kvm_test kvm_test.cpp ./elf-loader/elf_loader.c
+	$(CXX) -o kvm_test kvm_test.cpp ./elf-loader/elf_loader.c -lpthread
 
 hello_world.elf:
 	$(MAKE) -C ./bare-metal-aarch64

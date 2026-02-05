@@ -1,48 +1,23 @@
 # About
 
-All code was compiled and tested on a Cortex-A72 (ARMv8-A) processor running
-- Ubuntu 21.04 using GNU Make 4.3. (64 bit)
-- Ubuntu 23.10 (64 bit)
-- Raspberry Pi OS (October 10th 2023 Release) (64 bit)
+This project is based on: https://github.com/Lenz-K/arm64-kvm-hello-world.git
+
+**Note**: This fork only modifies `bare-metal-aarch64` and `kvm_test.cpp` to demonstrate 2 VCPUs running in parallel. The `bare-metal-aarch64-qemu` folder remains unchanged from the original repository, but may be broken and not work properly due to the changes in other parts of the project.
 
 
-# Contents
 
-## 1. bare-metal-aarch64-qemu
+# Two-VCPU Support
 
-The folder `bare-metal-aarch64-qemu` contains a bare metal AArch64 Assembly program that outputs "Hello World!\n".
-It is an adaption of [this](https://github.com/freedomtan/aarch64-bare-metal-qemu) repository.   
-`hello_world.elf` can be tested with QEMU.
-On a system with an AArch64 processor and `qemu-system-aarch64` installed run:
-```
-qemu-system-aarch64 -M virt -cpu host -enable-kvm -nographic -kernel hello_world.elf
-```
-On another architecture it can be emulated. Remove `-enable-kvm` and replace `-cpu host` with `-cpu cortex-a72` for example.
+The KVM test program now supports **two VCPUs**. Key changes include:
 
+- **Parallel Execution**: Each VCPU runs in its own pthread thread, allowing true parallel execution
+- **CPU Identification**: Each VCPU can identify itself using the MPIDR_EL1 register (Aff0 field contains CPU ID)
+- **Independent Stack Space**: Each CPU has its own 64KB stack space (CPU 0: 0x04020000, CPU 1: 0x04030000)
+- **Separate UART Devices**: CPU 0 writes to UART0 (0x10000000), CPU 1 writes to UART1 (0x10008000)
+- **Exit Detection**: The program uses '\n' (newline) in the message to determine when a VCPU has completed its output
+- **PSCI Handling**: If one VCPU calls `system_off` via HVC (Hypervisor Call), it will shutdown the entire VM, while another VCPU may still be working
 
-## 2. bare-metal-aarch64
-
-The folder `bare-metal-aarch64` contains an adaption of `bare-metal-aarch64-qemu`.
-The purpose of it, is to be run in a VM by the KVM test program ([4. KVM Test Program](https://github.com/Lenz-K/arm64-kvm-hello-world#4-kvm-test-program)).
-The build process ([Makefile](https://github.com/Lenz-K/arm64-kvm-hello-world/blob/main/bare-metal-aarch64/Makefile)) creates an ELF file.
-
-### Sources
-- https://developer.arm.com/documentation/102432/0100
-- https://github.com/freedomtan/aarch64-bare-metal-qemu
-
-## 3. elf-loader
-
-The folder `elf-loader` contains a c-program that is used
-(by [4. KVM Test Program](https://github.com/Lenz-K/arm64-kvm-hello-world#4-kvm-test-program))
-to load the required sections of an ELF file into the memory of the VM.
-
-### Sources
-- Joseph Koshy, (2010, January, 12), "libelf by Example"
-
-## 4. KVM Test Program
-
-The cpp-file [kvm_test.cpp](https://github.com/Lenz-K/arm64-kvm-hello-world/blob/main/kvm_test.cpp) contains a program that sets up an AArch64 VM and executes the `bare-metal-aarch64/hello-world.elf` program in the VM.
-As a starting point, [this](https://lwn.net/Articles/658512/) KVM test program for x86 was used.
-It is explained [here](https://lwn.net/Articles/658511/).
-To change the code from x86 to AArch64 the [KVM API Documentation](https://www.kernel.org/doc/html/latest/virt/kvm/api.html)
-and the [QEMU source code](https://gitlab.com/qemu-project/qemu.git) were used.
+The bare-metal code has been adapted to:
+- Read the CPU ID from MPIDR_EL1 register
+- Print different messages based on CPU ID ("C0!\n" for CPU 0, "C1!\n" for CPU 1)
+- Use WFI (Wait For Interrupt) loop instead of immediately shutting down after main() returns

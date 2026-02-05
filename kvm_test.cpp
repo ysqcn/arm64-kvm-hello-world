@@ -7,17 +7,29 @@
 #include <cstring>
 #include <sys/mman.h>
 #include <stdarg.h>
+#include <pthread.h>
 #include "elf-loader/elf_loader.h"
 
 #define MAX_VM_RUNS 20
 #define N_MEMORY_MAPPINGS 2
 #define MEMORY_BLOCK_SIZE 0x8000
+#define NUM_VCPUS 2
 
 using namespace std;
 
-int kvm, vmfd, vcpufd;
-struct kvm_run *run;
+int kvm, vmfd;
 u_int32_t memory_slot_count = 0;
+
+// Per-VCPU data structure
+struct vcpu_data {
+    int vcpu_id;
+    int vcpufd;
+    struct kvm_run *run;
+    char mmio_buffer[MAX_VM_RUNS];
+    int mmio_buffer_index;
+};
+
+struct vcpu_data vcpus[NUM_VCPUS];
 
 // Memory mappings between host and guest
 struct memory_mapping {
@@ -27,8 +39,8 @@ struct memory_mapping {
 };
 memory_mapping memory_mappings[N_MEMORY_MAPPINGS];
 
-int mmio_buffer_index = 0;
-char mmio_buffer[MAX_VM_RUNS];
+// Mutex for console output synchronization
+pthread_mutex_t print_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 /**
  * Execute an ioctl with the given arguments. Exit the program if there is an error.
@@ -143,6 +155,32 @@ int copy_section_into_memory(uint32_t *code, size_t memsz, uint64_t target_addr,
 }
 
 /**
+ * Handles a MMIO exit from KVM_RUN.
+ * Returns true if the output is complete (ends with newline).
+ */
+bool mmio_exit_handler(struct vcpu_data *vcpu) {
+    printf("[VCPU %d] Is Write: %d\n", vcpu->vcpu_id, vcpu->run->mmio.is_write);
+
+    if (vcpu->run->mmio.is_write) {
+        printf("[VCPU %d] Length: %d\n", vcpu->vcpu_id, vcpu->run->mmio.len);
+        uint64_t data = 0;
+        for (int j = 0; j < vcpu->run->mmio.len; j++) {
+            data |= vcpu->run->mmio.data[j]<<8*j;
+        }
+
+        vcpu->mmio_buffer[vcpu->mmio_buffer_index] = data;
+        vcpu->mmio_buffer_index++;
+        printf("[VCPU %d] Guest wrote 0x%08lX to 0x%08llX\n", vcpu->vcpu_id, data, vcpu->run->mmio.phys_addr);
+        
+        // Check if output is complete (ends with newline)
+        if (data == '\n') {
+            return true;
+        }
+    }
+    return false;
+}
+
+/**
  * Copies the required sections of the ELF file into the memory of the VM.
  *
  * @return 0 on success, -1 if an error occurred.
@@ -172,37 +210,18 @@ int copy_elf_into_memory() {
 }
 
 /**
- * Handles a MMIO exit from KVM_RUN.
- */
-void mmio_exit_handler() {
-    printf("Is Write: %d\n", run->mmio.is_write);
-
-    if (run->mmio.is_write) {
-        printf("Length: %d\n", run->mmio.len);
-        uint64_t data = 0;
-        for (int j = 0; j < run->mmio.len; j++) {
-            data |= run->mmio.data[j]<<8*j;
-        }
-
-        mmio_buffer[mmio_buffer_index] = data;
-        mmio_buffer_index++;
-        printf("Guest wrote 0x%08lX to 0x%08llX\n", data, run->mmio.phys_addr);
-    }
-}
-
-/**
  * Prints the reason of a system event exit from KVM_RUN.
  */
-void print_system_event_exit_reason() {
-    switch (run->system_event.type) {
+void print_system_event_exit_reason(struct vcpu_data *vcpu) {
+    switch (vcpu->run->system_event.type) {
     case KVM_SYSTEM_EVENT_SHUTDOWN:
-        printf("Cause: Shutdown\n");
+        printf("[VCPU %d] Cause: Shutdown\n", vcpu->vcpu_id);
         break;
     case KVM_SYSTEM_EVENT_RESET:
-        printf("Cause: Reset\n");
+        printf("[VCPU %d] Cause: Reset\n", vcpu->vcpu_id);
         break;
     case KVM_SYSTEM_EVENT_CRASH:
-        printf("Cause: Crash\n");
+        printf("[VCPU %d] Cause: Crash\n", vcpu->vcpu_id);
         break;
     }
 }
@@ -214,6 +233,71 @@ void close_fd(int fd) {
     int ret = close(fd);
     if (ret == -1)
         printf("Error while closing file: %s\n", strerror(errno));
+}
+
+/**
+ * VCPU thread function - each VCPU runs in its own thread
+ */
+void *vcpu_thread(void *arg) {
+    struct vcpu_data *vcpu = (struct vcpu_data *)arg;
+    int ret;
+    
+    printf("[VCPU %d] Thread started\n", vcpu->vcpu_id);
+    
+    /* Repeatedly run code and handle VM exits. */
+    bool shut_down = false;
+    for (int i = 0; i < MAX_VM_RUNS && !shut_down; i++) {
+        ret = ioctl(vcpu->vcpufd, KVM_RUN, NULL);
+        if (ret < 0) {
+            printf("[VCPU %d] System call 'KVM_RUN' failed: %d - %s\n", vcpu->vcpu_id, errno, strerror(errno));
+            printf("[VCPU %d] Error Numbers: EINTR=%d; ENOEXEC=%d; ENOSYS=%d; EPERM=%d\n", vcpu->vcpu_id, EINTR, ENOEXEC, ENOSYS, EPERM);
+            return NULL;
+        }
+        pthread_mutex_lock(&print_mutex);
+
+        printf("\n[VCPU %d] KVM_RUN Loop %d:\n", vcpu->vcpu_id, i+1);
+
+        switch (vcpu->run->exit_reason) {
+            case KVM_EXIT_MMIO:
+                printf("[VCPU %d] Exit Reason: KVM_EXIT_MMIO\n", vcpu->vcpu_id);
+                if (mmio_exit_handler(vcpu)) {
+                    printf("[VCPU %d] Output complete, exiting loop\n", vcpu->vcpu_id);
+                    shut_down = true;
+                }
+                break;
+            case KVM_EXIT_SYSTEM_EVENT:
+                // This happens when the VCPU has done a HVC based PSCI call.
+                printf("[VCPU %d] Exit Reason: KVM_EXIT_SYSTEM_EVENT\n", vcpu->vcpu_id);
+                print_system_event_exit_reason(vcpu);
+                shut_down = true;
+                break;
+            case KVM_EXIT_INTR:
+                printf("[VCPU %d] Exit Reason: KVM_EXIT_INTR\n", vcpu->vcpu_id);
+                i--; // Don't count this iteration
+                break;
+            case KVM_EXIT_FAIL_ENTRY:
+                printf("[VCPU %d] Exit Reason: KVM_EXIT_FAIL_ENTRY\n", vcpu->vcpu_id);
+                break;
+            case KVM_EXIT_INTERNAL_ERROR:
+                printf("[VCPU %d] Exit Reason: KVM_EXIT_INTERNAL_ERROR\n", vcpu->vcpu_id);
+                break;
+            default:
+                printf("[VCPU %d] Exit Reason: other\n", vcpu->vcpu_id);
+        }
+        pthread_mutex_unlock(&print_mutex);
+
+    }
+
+    pthread_mutex_lock(&print_mutex);
+    printf("\n[VCPU %d] VM MMIO Output:\n", vcpu->vcpu_id);
+    for(int i = 0; i < vcpu->mmio_buffer_index; i++) {
+        printf("%c", vcpu->mmio_buffer[i]);
+    }
+    printf("\n");
+    printf("[VCPU %d] Thread finished\n", vcpu->vcpu_id);
+    pthread_mutex_unlock(&print_mutex);
+    
+    return NULL;
 }
 
 /**
@@ -260,7 +344,8 @@ int main() {
      * 0x04000000 | RAM   |
      * 0x04010000 | Heap  | increases
      * 0x0401F000 | Stack | decreases, so the stack pointer is initially 0x04020000
-     * 0x10000000 | MMIO  |
+     * 0x10000000 | MMIO  | UART0
+     * 0x10008000 | MMIO  | UART1
      */
     check_vm_extension(KVM_CAP_USER_MEMORY, "KVM_CAP_USER_MEMORY");
 
@@ -282,16 +367,17 @@ int main() {
 
     /* Heap Memory */
     mem = allocate_memory_to_vm(MEMORY_BLOCK_SIZE * 2, 0x04010000);
-    /* Stack Memory */
-    // mem = allocate_memory_to_vm(MEMORY_BLOCK_SIZE, 0x04020000);
+    
+    /* Stack Memory - allocate 64KB (0x10000) per CPU */
+    /* CPU 0 stack: 0x04020000, CPU 1 stack: 0x04030000 */
+    mem = allocate_memory_to_vm(MEMORY_BLOCK_SIZE * NUM_VCPUS, 0x04020000);
 
-    /* MMIO Memory */
+    /* MMIO Memory - UART0 */
     check_vm_extension(KVM_CAP_READONLY_MEM, "KVM_CAP_READONLY_MEM"); // This will cause a write to 0x10000000, to result in a KVM_EXIT_MMIO.
     mem = allocate_memory_to_vm(MEMORY_BLOCK_SIZE, 0x10000000, KVM_MEM_READONLY);
 
-    /* Create a virtual CPU and receive its file descriptor */
-    printf("Creating VCPU\n");
-    vcpufd = ioctl_exit_on_error(vmfd, KVM_CREATE_VCPU, "KVM_CREATE_VCPU", (unsigned long) 0);
+    /* MMIO Memory - UART1 */
+    mem = allocate_memory_to_vm(MEMORY_BLOCK_SIZE, 0x10008000, KVM_MEM_READONLY);
 
     /* Get CPU information for VCPU init */
     printf("Retrieving physical CPU information\n");
@@ -302,74 +388,85 @@ int main() {
     check_vm_extension(KVM_CAP_ARM_PSCI_0_2, "KVM_CAP_ARM_PSCI_0_2");
     preferred_target.features[0] |= 1 << KVM_ARM_VCPU_PSCI_0_2;
 
-    /* Initialize VCPU */
-    printf("Initializing VCPU\n");
-    ioctl_exit_on_error(vcpufd, KVM_ARM_VCPU_INIT, "KVM_ARM_VCPU_INIT", &preferred_target);
-
-    /* Map the shared kvm_run structure and following data. */
+    /* Get VCPU mmap size */
     ret = ioctl_exit_on_error(kvm, KVM_GET_VCPU_MMAP_SIZE, "KVM_GET_VCPU_MMAP_SIZE", NULL);
     mmap_size = ret;
-    if (mmap_size < sizeof(*run))
+    if (mmap_size < sizeof(struct kvm_run))
         printf("KVM_GET_VCPU_MMAP_SIZE unexpectedly small");
-    void *void_mem = mmap(NULL, mmap_size, PROT_READ | PROT_WRITE, MAP_SHARED, vcpufd, 0);
-    run = static_cast<kvm_run *>(void_mem);
-    if (!run)
-        printf("Error while mmap vcpu");
-        
-    /* Set program counter to entry address */
-    check_vm_extension(KVM_CAP_ONE_REG, "KVM_CAP_ONE_REG");
-    uint64_t pc_index = offsetof(struct kvm_regs, regs.pc) / sizeof(__u32);
-    uint64_t pc_id = KVM_REG_ARM64 | KVM_REG_SIZE_U64 | KVM_REG_ARM_CORE | pc_index;
+
     uint64_t entry_addr = get_entry_address();
-    printf("Setting program counter to entry address 0x%08lX\n", entry_addr);
-    struct kvm_one_reg pc = {.id = pc_id, .addr = (uint64_t)&entry_addr};
-    ret = ioctl_exit_on_error(vcpufd, KVM_SET_ONE_REG, "KVM_SET_ONE_REG", &pc);
-    if (ret < 0)
-        return ret;
+    printf("Entry address: 0x%08lX\n", entry_addr);
 
-    /* Repeatedly run code and handle VM exits. */
-    printf("Running code\n");
-    bool shut_down = false;
-    for (int i = 0; i < MAX_VM_RUNS && !shut_down; i++) {
-        printf("\nKVM_RUN Loop %d:\n", i+1);
-        ret = ioctl(vcpufd, KVM_RUN, NULL);
+    /* Create and initialize VCPUs */
+    for (int i = 0; i < NUM_VCPUS; i++) {
+        printf("\nCreating VCPU %d\n", i);
+        
+        vcpus[i].vcpu_id = i;
+        vcpus[i].mmio_buffer_index = 0;
+        memset(vcpus[i].mmio_buffer, 0, MAX_VM_RUNS);
+        
+        /* Create a virtual CPU and receive its file descriptor */
+        vcpus[i].vcpufd = ioctl_exit_on_error(vmfd, KVM_CREATE_VCPU, "KVM_CREATE_VCPU", (unsigned long) i);
+
+        /* Map the shared kvm_run structure and following data. */
+        void *void_mem = mmap(NULL, mmap_size, PROT_READ | PROT_WRITE, MAP_SHARED, vcpus[i].vcpufd, 0);
+        vcpus[i].run = static_cast<kvm_run *>(void_mem);
+        if (!vcpus[i].run) {
+            printf("Error while mmap vcpu %d\n", i);
+            return -1;
+        }
+
+        /* Initialize VCPU */
+        printf("Initializing VCPU %d\n", i);
+        ioctl_exit_on_error(vcpus[i].vcpufd, KVM_ARM_VCPU_INIT, "KVM_ARM_VCPU_INIT", &preferred_target);
+        
+        /* Set MPIDR_EL1 register to identify CPU ID */
+        check_vm_extension(KVM_CAP_ONE_REG, "KVM_CAP_ONE_REG");
+        uint64_t mpidr_value = 0x80000000 | i; // Set CPU ID in Aff0 field
+        uint64_t mpidr_id = KVM_REG_ARM64 | KVM_REG_SIZE_U64 | KVM_REG_ARM_CORE | (2 * (offsetof(struct kvm_regs, regs) / sizeof(__u32)) + 5); // MPIDR_EL1 offset
+        struct kvm_one_reg mpidr_reg = {.id = mpidr_id, .addr = (uint64_t)&mpidr_value};
+        printf("Setting MPIDR_EL1 for VCPU %d to 0x%08lX\n", i, mpidr_value);
+        ret = ioctl(vcpus[i].vcpufd, KVM_SET_ONE_REG, &mpidr_reg);
         if (ret < 0) {
-            printf("System call 'KVM_RUN' failed: %d - %s\n", errno, strerror(errno));
-            printf("Error Numbers: EINTR=%d; ENOEXEC=%d; ENOSYS=%d; EPERM=%d\n", EINTR, ENOEXEC, ENOSYS, EPERM);
+            printf("Warning: Could not set MPIDR_EL1 for VCPU %d (this is normal, KVM sets it automatically)\n", i);
+        }
+        
+        /* Set program counter to entry address */
+        uint64_t pc_index = offsetof(struct kvm_regs, regs.pc) / sizeof(__u32);
+        uint64_t pc_id = KVM_REG_ARM64 | KVM_REG_SIZE_U64 | KVM_REG_ARM_CORE | pc_index;
+        printf("Setting program counter for VCPU %d to entry address 0x%08lX\n", i, entry_addr);
+        struct kvm_one_reg pc = {.id = pc_id, .addr = (uint64_t)&entry_addr};
+        ret = ioctl_exit_on_error(vcpus[i].vcpufd, KVM_SET_ONE_REG, "KVM_SET_ONE_REG", &pc);
+        if (ret < 0)
             return ret;
-        }
+    }
 
-        switch (run->exit_reason) {
-            case KVM_EXIT_MMIO:
-                printf("Exit Reason: KVM_EXIT_MMIO\n");
-                mmio_exit_handler();
-                break;
-            case KVM_EXIT_SYSTEM_EVENT:
-                // This happens when the VCPU has done a HVC based PSCI call.
-                printf("Exit Reason: KVM_EXIT_SYSTEM_EVENT\n");
-                print_system_event_exit_reason();
-                shut_down = true;
-                break;
-            case KVM_EXIT_INTR:
-                printf("Exit Reason: KVM_EXIT_INTR\n");
-                break;
-            case KVM_EXIT_FAIL_ENTRY:
-                printf("Exit Reason: KVM_EXIT_FAIL_ENTRY\n");
-                break;
-            case KVM_EXIT_INTERNAL_ERROR:
-                printf("Exit Reason: KVM_EXIT_INTERNAL_ERROR\n");
-                break;
-            default:
-                printf("Exit Reason: other\n");
+    /* Create threads for each VCPU */
+    pthread_t threads[NUM_VCPUS];
+    printf("\nStarting VCPU threads\n");
+    for (int i = 0; i < NUM_VCPUS; i++) {
+        ret = pthread_create(&threads[i], NULL, vcpu_thread, &vcpus[i]);
+        if (ret != 0) {
+            printf("Failed to create thread for VCPU %d: %s\n", i, strerror(ret));
+            return -1;
         }
     }
 
-    printf("\nVM MMIO Output:\n");
-    for(int i = 0; i < mmio_buffer_index; i++) {
-        printf("%c", mmio_buffer[i]);
+    /* Wait for all VCPU threads to complete */
+    printf("Waiting for VCPU threads to complete\n");
+    for (int i = 0; i < NUM_VCPUS; i++) {
+        ret = pthread_join(threads[i], NULL);
+        if (ret != 0) {
+            printf("Failed to join thread for VCPU %d: %s\n", i, strerror(ret));
+        }
     }
 
-    close_fd(vcpufd);
+    printf("\nAll VCPUs completed\n");
+
+    /* Clean up VCPUs */
+    for (int i = 0; i < NUM_VCPUS; i++) {
+        close_fd(vcpus[i].vcpufd);
+    }
     close_fd(vmfd);
     close_fd(kvm);
 
